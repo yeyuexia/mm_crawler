@@ -4,20 +4,11 @@ import urllib2
 import urlparse
 import Queue
 import threading
-import logging
+import traceback
 from functools import wraps
 
-from bs4 import BeautifulSoup
-
-LOG_FORMAT = "%(asctime)-15s -- %(message)s"
-logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
-logger = logging.getLogger("crawler")
-
-def info_log(message):
-    logger.info(message)
-
-def error_log(message):
-    logger.error(message)
+import html_parser
+from utils import info_log, error_log
 
 def lock(func):
     """a decorate for Master"""
@@ -76,14 +67,18 @@ class Master(object):
             cls.instance().scan.add(task[1])
             cls.instance().queue.put(task)
             info_log("push_task %s"%str(task))
+            return True
+        else:
+            return False
 
     @classmethod
     @lock
     def finish_task(cls, task):
         if task[0] == cls.TASK_TYPE_IMAGE:
-            if cls.instance().number < cls.instance().capicity:
-                cls.instance().number += 1
-            info_log("task %s finished, complete number:%d"%(str(task), cls.instance().number))
+            instance = cls.instance()
+            if instance.capicity<0 or instance.number < instance.capicity:
+                instance.number += 1
+            info_log("task %s finished, complete number:%d"%(str(task), instance.number))
         else:
             info_log("task %s finished"%str(task))
 
@@ -109,44 +104,8 @@ class Worker(threading.Thread):
         self.sleep_time = sleep_time
         self.sleep_count = 0
         self.output_path = output_path
+        self.html_parser = html_parser.HtmlParser()
         info_log("Worker init number:%d"%worker_number)
-
-    def _gen_url(self, host, url):
-        if url.startswith("/"):
-            url = host + url
-        return url.strip()
-
-    def _is_vaild_resource(self, url):
-        """simple check is vaild image resource
-        TODO: we can rewrite this method to get more effective result
-        """
-        if self._is_vaild_url(url) and url.endswith(".jpg") and url.find("meimei22.com/") != -1 and url.find("pic") != -1:
-            return True
-        return False
-
-    def _is_vaild_url(self, url):
-        """ simple check is a vaild url
-        TODO: we can rewrite this method to get more effective result
-        """
-        return True if url.startswith("http://") else False
-
-    def _parser_html(self, url, html):
-        """parser html and get the needed resources"""
-        soup = BeautifulSoup(html)
-        tasks, image_links, href_links = [], [], []
-        for img_tag in soup.find_all("img"):
-            link = img_tag.get("src")
-            if link:
-                link = self._gen_url(url, link)
-            image_links.append(link)
-        tasks.extend([(Master.TASK_TYPE_IMAGE, link) for link in image_links if self._is_vaild_resource(link)])
-        for href_tag in soup.find_all("a"):
-            link = href_tag.get("href")
-            if link:
-                link = self._gen_url(url, link)
-                href_links.append(link)
-        tasks.extend([(Master.TASK_TYPE_URL, link) for link in href_links if self._is_vaild_url(link)])
-        return tasks
 
     def run(self):
         while True:
@@ -154,29 +113,30 @@ class Worker(threading.Thread):
                 if Master.finished():
                     break
                 task = Master.get_task()
-                if not task:
+                if not task: # no task, sleep.
                     time.sleep(self.sleep_time)
                     self.sleep_count += 1
-                    if self.sleep_count >= self.max_sleep_times:
+                    if self.max_sleep_times > 0 and self.sleep_count >= self.max_sleep_times: # still no task for a long time, close task.
                         break
                     continue
                 task_type, url = task
                 res = urllib2.urlopen(url).read()
                 if task_type == Master.TASK_TYPE_IMAGE:
-                    output_file = os.path.join(self.output_path, url.replace("/", ""))
+                    file_name = urlparse.urlparse(url).path.strip("/").replace("/", "_")
+                    output_file = os.path.join(self.output_path, file_name)
                     if Master.finished(): break
                     open(output_file, "wb").write(res)
                 elif task_type == Master.TASK_TYPE_URL:
                     parser = urlparse.urlparse(url)
                     base_url = parser.scheme + "://" + parser.netloc
-                    tasks = self._parser_html(base_url, res)
+                    tasks = self.html_parser.parser_html(base_url, res)
                     if Master.finished(): break
-                    map(lambda task: Master.push_task(task), tasks)
+                    map(lambda t: Master.push_task(t), tasks)
                 Master.finish_task(task)
                 self.sleep_count = 0
             except Exception as e:
-                import traceback
                 error_log("worker %d error: %s\n%s"%(self.worker_number, e, traceback.format_exc()))
+                if task: Master.push_task(task)
                 if self.error_count > self.retry_times:
                     break
                 else:
@@ -189,6 +149,5 @@ def run(begin_url, capicity, output_path, thread_num):
     workers = map(lambda num: Worker(num, output_path), range(1, 1+thread_num))
     for worker in workers:
         worker.start()
-    for worker in workers:
-        worker.join()
+    while True: pass
     info_log("crawler finished")
